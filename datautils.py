@@ -17,6 +17,8 @@ import torchvision.transforms.functional as TF
 from matplotlib import pyplot as plt
 from multiprocessing import Pool
 
+import data_transforms as data_transforms
+
 
 def psd2pil(psd):
     # converts psd layers into pil list for augmentation
@@ -135,74 +137,25 @@ BLEND_DICT = {
 }
 
 
-class PSDBasicAugmentation:
-    # data augmentation on pil layers
-    def __init__(self, target_size, angle=0, top=0.0, left=0.0, height=1.0, width=1.0, hflip=False, vflip=False, scale=0.4):
-        self.set_params(target_size, angle, top, left, height, width, hflip, vflip, scale)
-
-    def set_params(self, target_size, angle, top, left, height, width, hflip, vflip, scale):
-        self.angle = angle
-        if isinstance(target_size, (int, float)):
-            target_size = (target_size, target_size)
-        self.target_size = target_size
-        self.top = top
-        self.left = left
-        self.height = height
-        self.width = width
-        self.hflip = hflip
-        self.vflip = vflip
-        self.scale = scale
-
-    def roll(self):
-        self.angle = random.randint(-90, 90)
-        self.top = np.random.random() * 0.05
-        self.left = np.random.random() * 0.05
-        self.height = np.clip(1.0 + np.random.randn() / 50, 0.5, 1.5)
-        self.width = np.clip(self.height + np.random.randn() / 50, 0.5, 1.5)
-        self.hflip = random.random() < 0.5
-        self.vflip = random.random() < 0.1
-        self.scale = random.random()
-        return self
-
-    def apply(self, x):
-        w, h = x.size
-        scale = (self.scale / 2 + 0.8) * min(self.target_size) / min(w, h)
-        x = TF.resize(x, (int(h * self.height * scale), int(w * self.width * scale)))
-        x = TF.rotate(x, self.angle)
-        x = TF.crop(x, self.top, self.left, self.target_size[1], self.target_size[0])
-        if self.hflip:
-            x = TF.hflip(x)
-        if self.vflip:
-            x = TF.vflip(x)
-        return x
-
-    def __call__(self, data):
-        # layers: list of (name, RGBA PIL images, opacity, visible, blend_mode, is_clip)
-        transformed_layers = []
-        for name, x, opacity, visible, blend_mode, is_clip in data['layers']:
-            x = self.apply(x)
-            transformed_layers.append([name, x, opacity, visible, blend_mode, is_clip])
-        ret = {
-            'preview': self.apply(data['preview']),
-            'layers': transformed_layers
-        }
-        return ret
-
-
 class PSDPickleDataset(Dataset):
     # ./root_dir
     #     - sample 1
     #       - 0.pkl
     #       - 1.pkl
-    def __init__(self, root_dir, max_layers=64, transform=None, post_filter=default_post_filter):
+    def __init__(self, root_dir, max_layers=64, post_filter=default_post_filter, transform=None):
         self.root_dir = root_dir
-        self.transform = transform
         self.post_filter = post_filter
         self.max_layers = max_layers
+        self.transform = transform
         
         self.paths = []
+        self.n_samples = len(os.listdir(root_dir))
+        self.sample_list = []
+        self.sample_psd_cnt = []
         for sample in os.listdir(root_dir):
             n = len(os.listdir(os.path.join(root_dir, sample)))
+            self.sample_list.append(sample)
+            self.sample_psd_cnt.append(n)
             self.paths += [os.path.join(sample, '%d.pkl' % (i)) for i in range(n)]
 
     def load_pkl_data(self, path, remove_occluded, warp, resize_to_final):
@@ -222,9 +175,6 @@ class PSDPickleDataset(Dataset):
             for i in range(len(sample['layers'])):
                 sample['layers'][i][1] = sample['layers'][i][1].resize((final_width, final_height), Image.ANTIALIAS)
 
-        if self.transform:
-            self.transform.roll()
-            sample = self.transform(sample)
         layers, preview = pil2tensor(sample, self.post_filter, remove_occluded)
         tensors, blend_modes = [], []
         for layer, blend_mode in layers:
@@ -242,33 +192,37 @@ class PSDPickleDataset(Dataset):
             blend_padding = np.ones(self.max_layers - len(tensors), dtype=np.uint8) * BLEND_DICT[b'padding']
             blend_modes = np.concatenate((blend_padding, blend_modes))
             tensors = np.concatenate((padding, tensors))
-        tensors = tensors.transpose((0, 3, 1, 2))
+        if self.transform is not None:
+            tensors = self.transform(tensors)
         one_hot_bm = np.identity(len(BLEND_DICT))[blend_modes]
         one_hot_bm[one_hot_bm[:, BLEND_DICT[b'padding']] == 1, BLEND_DICT[BlendMode.NORMAL]] = 1
         return tensors, one_hot_bm, len(sample['layers'])
 
-    def load_preview_data(self, path, warp, resize_to_final, transform=None):
-        sample = load_from_pickle(path)
-        M = np.array(sample['transform'])
-        final_width, final_height = sample['finishing_size']
-        preview = sample['preview']
-        w, h = preview.size
+    def load_preview_data(self, paths, warp, resize_to_final):
+        previews = []
+        for path in paths:
+            sample = load_from_pickle(path)
+            M = np.array(sample['transform'])
+            final_width, final_height = sample['finishing_size']
+            preview = sample['preview']
+            previews.append(preview)
 
-        if warp and np.linalg.norm(M - np.eye(3)) > 5e-3:
-            preview = np.array(preview).astype(np.float32)
-            preview = cv2.warpPerspective(preview, M, (final_width, final_height))
-            preview = Image.fromarray(preview.astype(np.uint8))
-        elif resize_to_final and (w != final_width or h != final_height):
-            preview = preview.resize((final_width, final_height), Image.ANTIALIAS)
+        for i, preview in enumerate(previews):
+            w, h = preview.size
+            if warp and np.linalg.norm(M - np.eye(3)) > 5e-3:
+                preview = np.array(preview).astype(np.float32)
+                preview = cv2.warpPerspective(preview, M, (final_width, final_height))
+                preview = Image.fromarray(preview.astype(np.uint8))
+            elif resize_to_final and (w != final_width or h != final_height):
+                preview = preview.resize((final_width, final_height), Image.ANTIALIAS)
+            preview = np.array(preview).astype(np.float32) / 255.
+            previews[i] = preview[:, :, :3]
 
-        if transform:
-            preview = transform.apply(preview)
-        elif self.transform:
-            self.transform.roll()
-            preview = self.transform.apply(preview)
+        previews = np.stack(previews)
+        if self.transform is not None:
+            previews = self.transform(previews)
 
-        preview = np.array(preview).astype(np.float32) / 255.
-        return preview[:, :, :3].transpose((2, 0, 1))
+        return previews
 
 
 def normalize_img(img):
@@ -280,8 +234,44 @@ def denormalize_img(img):
 
 
 class PSDPreviewPairDataset(PSDPickleDataset):
+    def __init__(self, root_dir, transform=None, warp=True, resize_to_final=True, stage=0.6):
+        super(PSDPreviewPairDataset, self).__init__(root_dir, 0, default_post_filter, transform=transform)
+        self.warp = warp
+        self.resize_to_final = resize_to_final
+        self.stage = stage
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        path = self.sample_list[idx]
+        final_path = os.path.join(self.root_dir, path, '%d.pkl' % (self.sample_psd_cnt[idx] - 1))
+        idx = int(np.floor((self.sample_psd_cnt[idx] - 1) * self.stage * np.random.rand()))
+        sketch_path = os.path.join(self.root_dir, path, '%d.pkl' % (idx))
+        paths = [sketch_path, final_path]
+        previews = self.load_preview_data(paths, self.warp, self.resize_to_final)
+        return previews[0], previews[1]
+
+
+class PSDPreviewFinishingDataset(PSDPickleDataset):
     def __init__(self, root_dir, transform=None, warp=True, resize_to_final=True):
-        super(PSDPreviewPairDataset, self).__init__(root_dir, 0, transform, default_post_filter)
+        super(PSDPreviewFinishingDataset, self).__init__(root_dir, 0, default_post_filter, transform=transform)
+        self.warp = warp
+        self.resize_to_final = resize_to_final
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        path = self.sample_list[idx]
+        sample_path = os.path.join(self.root_dir, path, '%d.pkl' % (self.sample_psd_cnt[idx] - 1))
+        preview_last = self.load_preview_data(sample_path, self.warp, self.resize_to_final)
+        return preview_last
+
+
+class PSDImageDataset(PSDPickleDataset):
+    def __init__(self, root_dir, warp=False, resize_to_final=False):
+        super(PSDImageDataset, self).__init__(root_dir, 0, None, default_post_filter)
         self.warp = warp
         self.resize_to_final = resize_to_final
 
@@ -289,23 +279,10 @@ class PSDPreviewPairDataset(PSDPickleDataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        path = self.paths[idx]
-        sample_name = os.path.split(self.paths[idx])[0]
-        cnt = idx
-        while cnt < len(self.paths) and os.path.split(self.paths[cnt])[0] == sample_name:
-            cnt += 1
-        cnt -= 1
-        last_path = self.paths[cnt]
-        path = os.path.join(self.root_dir, path)
-        last_path = os.path.join(self.root_dir, last_path)
-        if self.transform:
-            self.transform.roll()
-        preview_cur = self.load_preview_data(path, self.warp, self.resize_to_final, transform=self.transform)
-        preview_last = self.load_preview_data(last_path, self.warp, self.resize_to_final, transform=self.transform)
-        # normalize to [-1, 1]
-        preview_cur = normalize_img(preview_cur)
-        preview_last = normalize_img(preview_last)
-        return preview_cur, preview_last
+        path = os.path.join(self.root_dir, self.paths[idx])
+        preview = self.load_preview_data(path, self.warp, self.resize_to_final)
+        preview = Image.fromarray((preview.transpose((1, 2, 0)) * 255).astype(np.uint8))
+        return preview
 
 
 def psd2pickle(psd, save_path, attrs={}):
@@ -346,6 +323,21 @@ def dataset_psd2pkl_worker(args):
     path, files, delete_psd = args
     if len(files) == 0:
         return
+
+    has_pkl, has_psd = False, False
+    for f in files:
+        if 'pkl' in f:
+            has_pkl = True
+        if 'psd' in f:
+            has_psd = True
+    if has_pkl and not has_psd:
+        return
+    if has_pkl and has_psd:
+        print(path)
+        return
+
+    print(args)
+    
     files = ['%d.psd' % (j) for j in sorted([int(i.split('.')[0]) for i in files])[::-1]]
     name = files[0].split('.')[0]
     psd_path = os.path.join(path, files[0])
@@ -384,8 +376,13 @@ def dataset_psd2pkl_worker(args):
         search_params = dict(checks = 50)
 
         flann = cv2.FlannBasedMatcher(index_params, search_params)
-
-        matches = flann.knnMatch(des1,des2,k=2)
+        if des1.shape[0] > 1000 and des2.shape[0] > 1000:
+            des1 = des1[:1000]
+            des2 = des2[:1000]
+        if des1 is not None and des2 is not None and des1.shape[0] >= 2 and des2.shape[0] >= 2:
+            matches = flann.knnMatch(des1,des2,k=2)
+        else:
+            matches = []
 
         # store all the good matches as per Lowe's ratio test.
         good = []
@@ -400,6 +397,9 @@ def dataset_psd2pkl_worker(args):
             perspective, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         else:
             mask = None
+            perspective = np.eye(3)
+        if perspective is None:
+            M = np.eye(3)
             perspective = np.eye(3)
         
         M = M @ perspective
@@ -456,26 +456,30 @@ def LinearComposite(tensors, blend_modes, background=1):
 
 def test_loader():
     # dataset_psd2pkl('./debug/dataset/set', n_processes=16, delete_psd=True)
-    """
-    ml = 16
-    dataset = PSDPickleDataset('./debug/dataset/set', max_layers=ml, transform=PSDBasicAugmentation((512, 512)), post_filter=drop_full_post_filter)
+    # ml = 16
+    train_transforms = data_transforms.Compose([
+        data_transforms.Resize(300),
+        data_transforms.RandomCrop(256),
+        data_transforms.ToTensor()
+    ])
+    # dataset = PSDPickleDataset('/home/ubuntu/nvme/dataset/figures', max_layers=ml, transform=train_transforms, post_filter=drop_full_post_filter)
 
-    dataset = PSDPreviewPairDataset('./debug/dataset/set')
-    cur, last = dataset[79]
-    cur = np.uint8(denormalize_img(cur)).transpose((1, 2, 0))
-    last = np.uint8(denormalize_img(last)).transpose((1, 2, 0))
-    Image.fromarray(cur).save('./debug/cur.png')
-    Image.fromarray(last).save('./debug/last.png')
+    # tensors, bm, _ = dataset.load_pkl_data('/home/ubuntu/nvme/dataset/figures/34b447c5f9ae4d4b858475eacd09ce38/4.pkl', False, True, False)
+    # tensors, bm = torch.tensor(tensors).unsqueeze(0), torch.tensor(bm).unsqueeze(0)
+    # res = LinearComposite(tensors, bm, background=0.5)
+    # print(bm)
+    # print(res.shape)
+    # res = res[0].permute((1, 2, 0)).detach().cpu().numpy()
+    # Image.fromarray(np.uint8(res * 255)).convert('RGB').save('./composite.png')
 
-    dataset = PSDPickleDataset('./debug/dataset/set', max_layers=ml, transform=None, post_filter=drop_full_post_filter)
-    tensors, bm = dataset.load_pkl_data('./debug/dataset/set/34b447c5f9ae4d4b858475eacd09ce38/1.pkl', False, True, False)
-    tensors, bm = torch.tensor(tensors).unsqueeze(0), torch.tensor(bm).unsqueeze(0)
-    res = LinearComposite(tensors, bm, background=0.5)
-    print(bm)
-    print(res.shape)
-    res = res[0].permute((1, 2, 0)).detach().cpu().numpy()
-    Image.fromarray(np.uint8(res * 255)).convert('RGB').save('./debug/composite.png')
-    """
+    dataset = PSDPreviewPairDataset('/home/ubuntu/nvme/dataset/figures', transform=train_transforms)
+    sketch, finishing = dataset[123]
+    finishing = finishing.permute((1, 2, 0)).detach().cpu().numpy()
+    img = np.uint8(finishing * 255)
+    Image.fromarray(img).save('debug0.png')
+    sketch = sketch.permute((1, 2, 0)).detach().cpu().numpy()
+    img = np.uint8(sketch * 255)
+    Image.fromarray(img).save('debug1.png')
 
 
 if __name__ == '__main__':
